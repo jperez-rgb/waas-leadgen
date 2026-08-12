@@ -21,13 +21,11 @@ from playwright.sync_api import sync_playwright
 
 logger = logging.getLogger(__name__)
 
-# Free/low-effort site builders -- a domain on one of these almost always means
-# "no real website," even if it technically loads fine.
 PLACEHOLDER_HOST_SUBSTRINGS = [
     "sites.google.com",
     "linktr.ee",
     "facebook.com",
-    "business.site",       # Google Business free site builder
+    "business.site",
     "godaddysites.com",
     "weebly.com",
     "wixsite.com",
@@ -35,15 +33,15 @@ PLACEHOLDER_HOST_SUBSTRINGS = [
     "carrd.co",
 ]
 
-THIN_CONTENT_WORD_THRESHOLD = 40   # fewer real words than this -> "thin"
-OUTDATED_COPYRIGHT_YEAR_CUTOFF = 2020  # copyright year older than this -> "outdated" signal
+THIN_CONTENT_WORD_THRESHOLD = 40
+OUTDATED_COPYRIGHT_YEAR_CUTOFF = 2020
 
 COPYRIGHT_YEAR_RE = re.compile(r"(?:©|copyright)\D{0,10}(20\d{2})", re.IGNORECASE)
 
 
 @dataclass
 class GradeResult:
-    status: str          # one of the website_status enum values
+    status: str
     notes: str
     word_count: int = 0
     has_viewport_meta: bool = False
@@ -61,17 +59,12 @@ def grade_website(url: str | None, screenshot_dir: str | None = None,
     if not url:
         return GradeResult(status="none", notes="No website listed on Google Business Profile.")
 
-    if _host_is_placeholder_builder(url):
-        # Still worth a quick visit to grab word count for the notes field,
-        # but we already know the verdict from the host alone.
-        pass
-
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         try:
             page = browser.new_page(
-                viewport={"width": 390, "height": 844},  # mobile viewport on purpose --
-                user_agent=(                              # we specifically care whether
+                viewport={"width": 390, "height": 844},
+                user_agent=(
                     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
                     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
                 ),
@@ -88,23 +81,40 @@ def grade_website(url: str | None, screenshot_dir: str | None = None,
                 )
 
             if response is not None and response.status >= 400:
+                if response.status in (401, 403, 429, 503):
+                    return GradeResult(
+                        status="unreachable",
+                        notes=(
+                            f"HTTP {response.status} -- likely bot-detection blocking the "
+                            f"automated check, NOT necessarily a real outage. "
+                            f"VERIFY MANUALLY in a real browser before using this as a pitch point."
+                        ),
+                    )
                 return GradeResult(
                     status="unreachable",
                     notes=f"Site returned HTTP {response.status}.",
                 )
 
-            # Give client-rendered sites a moment to paint.
             page.wait_for_timeout(1500)
 
-            text_content = page.evaluate("document.body ? document.body.innerText : ''") or ""
-            word_count = len(text_content.split())
-
-            has_viewport_meta = page.evaluate(
-                "!!document.querySelector('meta[name=\"viewport\"]')"
-            )
+            try:
+                text_content = page.evaluate("document.body ? document.body.innerText : ''") or ""
+                has_viewport_meta = page.evaluate(
+                    "!!document.querySelector('meta[name=\"viewport\"]')"
+                )
+            except PlaywrightError as exc:
+                logger.info("Execution context lost while reading %s (likely a redirect): %s", url, exc)
+                return GradeResult(
+                    status="unreachable",
+                    notes=(
+                        "Page kept redirecting/navigating while we tried to read it -- "
+                        "could not reliably analyze. VERIFY MANUALLY before treating as broken."
+                    ),
+                )
 
             year_match = COPYRIGHT_YEAR_RE.search(text_content)
             copyright_year = int(year_match.group(1)) if year_match else None
+            word_count = len(text_content.split())
 
             screenshot_path = None
             if screenshot_dir:
@@ -116,9 +126,8 @@ def grade_website(url: str | None, screenshot_dir: str | None = None,
                 except PlaywrightError:
                     screenshot_path = None
 
-            # --- Classification ---------------------------------------------------
             if _host_is_placeholder_builder(url):
-                status = "thin" if "facebook.com" not in urlparse(url).netloc else "thin"
+                status = "thin"
                 notes = f"Hosted on a free site builder ({urlparse(url).netloc}); treat as no real website."
             elif word_count < THIN_CONTENT_WORD_THRESHOLD:
                 status = "thin"
