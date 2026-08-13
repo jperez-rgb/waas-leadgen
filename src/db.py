@@ -26,6 +26,15 @@ def get_client(url: str, key: str) -> Client:
     return create_client(url, key)
 
 
+def is_query_completed(client: Client, query: str) -> bool:
+    resp = client.table("scrape_progress").select("query").eq("query", query).execute()
+    return len(resp.data or []) > 0
+
+
+def mark_query_completed(client: Client, query: str) -> None:
+    client.table("scrape_progress").upsert({"query": query}, on_conflict="query").execute()
+
+
 def upsert_place(client: Client, place: PlaceResult, city: str, county: str,
                   source_query: str, niche: str) -> None:
     """Insert or update a lead by place_id. Never overwrites website grading
@@ -175,3 +184,31 @@ def get_golden_leads(client: Client, min_rating: float, min_reviews: int) -> lis
         .execute()
     )
     return resp.data or []
+
+
+def update_reply_status(client: Client, place_id: str, status: str, notes: str | None = None) -> None:
+    """
+    status: one of 'no_reply', 'interested', 'not_interested', 'needs_followup',
+    'closed_won', 'closed_lost'. Call this whenever a lead replies to a cold email
+    so nothing gets lost -- there's no automatic reply detection here (that would
+    need an Instantly webhook, a future addition), this is meant to be updated
+    manually via a quick script or the Supabase table editor as replies come in.
+    """
+    payload: dict = {"reply_status": status, "last_contacted_at": datetime.now(timezone.utc).isoformat()}
+    if notes:
+        payload["reply_notes"] = notes
+    client.table("leads").update(payload).eq("place_id", place_id).execute()
+
+
+def get_leads_by_reply_status(client: Client, status: str) -> list[dict]:
+    resp = client.table("leads").select("*").eq("reply_status", status).execute()
+    return resp.data or []
+
+
+def mark_unsubscribed(client: Client, email: str) -> None:
+    """Marks every lead row matching this email as unsubscribed. Wired to
+    Instantly's unsubscribe webhook eventually -- for now, callable manually
+    if someone emails back asking to be removed."""
+    client.table("leads").update(
+        {"unsubscribed": True, "email_status": "unsubscribed"}
+    ).eq("contact_email", email).execute()
