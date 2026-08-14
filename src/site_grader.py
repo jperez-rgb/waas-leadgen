@@ -143,6 +143,24 @@ def _grade_page(page, url: str, screenshot_dir: str | None, timeout_ms: int) -> 
     )
 
 
+def _block_heavy_resources(page) -> None:
+    """
+    We only ever read text content and check for a viewport meta tag -- actual
+    images/fonts/video contribute nothing to that and just cost memory per
+    page load. Blocking them at the network level cuts per-page footprint
+    substantially across a run visiting thousands of different sites.
+    Tradeoff: any screenshot captured (see screenshot_dir) will look plain/
+    broken with images missing -- acceptable since screenshots aren't used
+    anywhere in the current classification logic, just an optional artifact.
+    """
+    page.route(
+        "**/*",
+        lambda route: route.abort()
+        if route.request.resource_type in ("image", "media", "font")
+        else route.continue_(),
+    )
+
+
 def grade_website(url: str | None, screenshot_dir: str | None = None,
                    timeout_ms: int = 15000, browser=None) -> GradeResult:
     """
@@ -170,6 +188,7 @@ def grade_website(url: str | None, screenshot_dir: str | None = None,
                 "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
             ),
         )
+        _block_heavy_resources(page)
         try:
             return _grade_page(page, url, screenshot_dir, timeout_ms)
         finally:
@@ -185,6 +204,7 @@ def grade_website(url: str | None, screenshot_dir: str | None = None,
                     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
                 ),
             )
+            _block_heavy_resources(page)
             try:
                 return _grade_page(page, url, screenshot_dir, timeout_ms)
             finally:

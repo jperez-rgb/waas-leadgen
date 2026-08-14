@@ -34,22 +34,35 @@ logger = logging.getLogger(__name__)
 # anything more sophisticated.
 _progress_lock = threading.Lock()
 
-# One Playwright browser per worker THREAD, reused for every lead that thread
-# ever processes in this run -- not one browser per lead. Launching/tearing
-# down a full Chromium process tens of thousands of times (even at low
-# concurrency) is exactly the pattern that caused Render's OOM restart;
-# reusing one browser per thread cuts that down to just GRADE_WORKERS browser
-# launches for the entire run. Threads in a ThreadPoolExecutor are long-lived
-# for the pool's duration, so "lazily create once per thread" naturally means
-# "create once, reuse for everything that thread does."
+# One Playwright browser per worker THREAD, recycled (closed + relaunched)
+# every BROWSER_RECYCLE_EVERY leads instead of kept alive for the entire run.
+# Reusing forever isn't enough on its own -- visiting thousands of *different*
+# websites in one long-lived Chromium process still causes gradual internal
+# memory growth (per-site renderer processes, caching) that only a fresh
+# browser process resets. Recycling periodically caps that growth instead of
+# letting it accumulate for the whole multi-day run.
+BROWSER_RECYCLE_EVERY = 200
+
 _thread_local = threading.local()
 
 
 def _get_thread_browser():
-    if not hasattr(_thread_local, "browser"):
+    needs_new = (
+        not hasattr(_thread_local, "browser")
+        or _thread_local.count >= BROWSER_RECYCLE_EVERY
+    )
+    if needs_new:
+        if hasattr(_thread_local, "browser"):
+            try:
+                _thread_local.browser.close()
+                _thread_local.playwright.stop()
+            except Exception:  # noqa: BLE001 -- best-effort cleanup, never let this crash the run
+                pass
         playwright = sync_playwright().start()
         _thread_local.playwright = playwright
         _thread_local.browser = playwright.chromium.launch(headless=True)
+        _thread_local.count = 0
+    _thread_local.count += 1
     return _thread_local.browser
 
 

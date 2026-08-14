@@ -140,6 +140,17 @@ def _find_email_on_page(page, url: str) -> EmailFindResult:
     )
 
 
+def _block_heavy_resources(page) -> None:
+    """Same reasoning as site_grader's version -- we only ever read mailto
+    links and body text, images/fonts/media add nothing but memory cost."""
+    page.route(
+        "**/*",
+        lambda route: route.abort()
+        if route.request.resource_type in ("image", "media", "font")
+        else route.continue_(),
+    )
+
+
 def find_email(url: str, timeout_ms: int = 15000, browser=None) -> EmailFindResult:
     """
     Same reasoning as site_grader.grade_website: if `browser` is provided,
@@ -156,6 +167,7 @@ def find_email(url: str, timeout_ms: int = 15000, browser=None) -> EmailFindResu
     if browser is not None:
         page = browser.new_page()
         page.set_default_timeout(timeout_ms)
+        _block_heavy_resources(page)
         try:
             return _find_email_on_page(page, url)
         finally:
@@ -166,6 +178,7 @@ def find_email(url: str, timeout_ms: int = 15000, browser=None) -> EmailFindResu
         try:
             page = fresh_browser.new_page()
             page.set_default_timeout(timeout_ms)
+            _block_heavy_resources(page)
             try:
                 return _find_email_on_page(page, url)
             finally:
