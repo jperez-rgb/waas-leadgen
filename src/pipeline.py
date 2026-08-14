@@ -17,6 +17,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from playwright.sync_api import sync_playwright
+
 from . import db
 from .config import NICHES, TARGET_AREAS, Settings
 from .email_finder import EmailFindResult, find_email
@@ -31,6 +33,24 @@ logger = logging.getLogger(__name__)
 # enough here -- we only need "how many done so far" for log lines, not
 # anything more sophisticated.
 _progress_lock = threading.Lock()
+
+# One Playwright browser per worker THREAD, reused for every lead that thread
+# ever processes in this run -- not one browser per lead. Launching/tearing
+# down a full Chromium process tens of thousands of times (even at low
+# concurrency) is exactly the pattern that caused Render's OOM restart;
+# reusing one browser per thread cuts that down to just GRADE_WORKERS browser
+# launches for the entire run. Threads in a ThreadPoolExecutor are long-lived
+# for the pool's duration, so "lazily create once per thread" naturally means
+# "create once, reuse for everything that thread does."
+_thread_local = threading.local()
+
+
+def _get_thread_browser():
+    if not hasattr(_thread_local, "browser"):
+        playwright = sync_playwright().start()
+        _thread_local.playwright = playwright
+        _thread_local.browser = playwright.chromium.launch(headless=True)
+    return _thread_local.browser
 
 
 def run_scrape(settings: Settings) -> None:
@@ -92,8 +112,9 @@ def _grade_one(lead: dict, settings: Settings) -> tuple[dict, GradeResult]:
     # don't all fire their first request in the same instant.
     time.sleep(random.uniform(0, 1.5))
     try:
+        browser = _get_thread_browser()
         grade = grade_website(url, screenshot_dir=settings.screenshot_dir,
-                               timeout_ms=settings.site_grade_timeout_ms)
+                               timeout_ms=settings.site_grade_timeout_ms, browser=browser)
     except Exception as exc:  # noqa: BLE001 -- a single site's quirks must never kill a multi-hour batch
         logger.error("Unexpected error grading %s (%s): %s -- marking for manual review, continuing.",
                      lead.get("business_name"), url, exc)
@@ -106,13 +127,14 @@ def _grade_one(lead: dict, settings: Settings) -> tuple[dict, GradeResult]:
 
 def run_grade(settings: Settings, max_leads: int | None = None) -> None:
     """
-    Grades leads in parallel using a thread pool -- each grade_website() call
-    launches its own independent Playwright browser instance, so this is safe
-    to parallelize: no shared browser state between threads, and each thread
-    hits a *different* business's website, so there's no politeness concern
-    with running several at once (we're never hitting the same host twice
-    concurrently). Worker count is tunable via GRADE_WORKERS since the right
-    number depends on the machine's CPU/memory -- start around 4-8.
+    Grades leads in parallel using a thread pool. Each worker thread launches
+    ONE Playwright browser and reuses it for every lead it processes (see
+    _get_thread_browser) -- not a fresh browser per lead. This is safe to
+    parallelize since each thread hits a *different* business's website (no
+    politeness concern running several at once). Worker count is tunable via
+    GRADE_WORKERS since the right number depends on the machine's CPU/memory
+    -- on a memory-constrained instance, keep this low (2-3); with more RAM,
+    4-8 is reasonable.
     """
     client = db.get_client(settings.supabase_url, settings.supabase_key)
     leads = db.get_ungraded_leads(
@@ -149,7 +171,8 @@ def _find_email_one(lead: dict, settings: Settings) -> tuple[dict, EmailFindResu
     url = lead.get("website_url")
     time.sleep(random.uniform(0, 1.5))
     try:
-        result = find_email(url, timeout_ms=settings.site_grade_timeout_ms)
+        browser = _get_thread_browser()
+        result = find_email(url, timeout_ms=settings.site_grade_timeout_ms, browser=browser)
     except Exception as exc:  # noqa: BLE001 -- same reasoning as run_grade: never let one site kill the batch
         logger.error("Unexpected error finding email on %s (%s): %s -- skipping, continuing.",
                      lead.get("business_name"), url, exc)
