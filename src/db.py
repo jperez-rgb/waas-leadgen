@@ -78,23 +78,41 @@ def upsert_place(client: Client, place: PlaceResult, city: str, county: str,
     client.table("leads").upsert(payload, on_conflict="place_id").execute()
 
 
+PAGE_SIZE = 1000  # Supabase's own server-side cap, regardless of what limit we pass -- see functions below.
+
+
 def get_ungraded_leads(client: Client, min_rating: float, min_reviews: int,
                         limit: int = 500) -> list[dict]:
     """
     Leads that meet the reputation bar (rating/review count) and either have
     a website we haven't visited yet, or no website at all (already gradeable
     without a visit, but we still want them flagged if somehow missed).
+
+    Paginates in pages of PAGE_SIZE. This matters regardless of Supabase's
+    project-level "Max Rows" setting: even with that raised, relying on a
+    single request to return an arbitrarily large `limit` is fragile -- this
+    makes the function actually return up to `limit` rows no matter what,
+    without depending on a dashboard setting staying configured correctly.
     """
-    resp = (
-        client.table("leads")
-        .select("*")
-        .eq("website_status", "unknown")
-        .gte("rating", min_rating)
-        .gte("review_count", min_reviews)
-        .limit(limit)
-        .execute()
-    )
-    return resp.data or []
+    all_leads: list[dict] = []
+    offset = 0
+    while len(all_leads) < limit:
+        page_limit = min(PAGE_SIZE, limit - len(all_leads))
+        resp = (
+            client.table("leads")
+            .select("*")
+            .eq("website_status", "unknown")
+            .gte("rating", min_rating)
+            .gte("review_count", min_reviews)
+            .range(offset, offset + page_limit - 1)
+            .execute()
+        )
+        batch = resp.data or []
+        all_leads.extend(batch)
+        if len(batch) < page_limit:
+            break  # fewer rows than asked for -- we've hit the end of what matches
+        offset += page_limit
+    return all_leads
 
 
 def upsert_grade(client: Client, place_id: str, grade: GradeResult) -> None:
@@ -115,20 +133,31 @@ def get_bucket_a_leads_for_email_search(client: Client, min_rating: float, min_r
     i.e. website_status is thin/outdated/generic_builder (has SOME url) and we
     haven't searched it yet. Excludes 'none'/'unreachable' entirely since those
     have no site to visit in the first place.
+
+    Paginated the same way as get_ungraded_leads -- see its docstring for why.
     """
-    resp = (
-        client.table("leads")
-        .select("*")
-        .in_("website_status", ["thin", "outdated", "generic_builder"])
-        .not_.is_("website_url", "null")
-        .is_("email_searched_at", "null")
-        .gte("rating", min_rating)
-        .gte("review_count", min_reviews)
-        .not_.is_("phone", "null")
-        .limit(limit)
-        .execute()
-    )
-    return resp.data or []
+    all_leads: list[dict] = []
+    offset = 0
+    while len(all_leads) < limit:
+        page_limit = min(PAGE_SIZE, limit - len(all_leads))
+        resp = (
+            client.table("leads")
+            .select("*")
+            .in_("website_status", ["thin", "outdated", "generic_builder"])
+            .not_.is_("website_url", "null")
+            .is_("email_searched_at", "null")
+            .gte("rating", min_rating)
+            .gte("review_count", min_reviews)
+            .not_.is_("phone", "null")
+            .range(offset, offset + page_limit - 1)
+            .execute()
+        )
+        batch = resp.data or []
+        all_leads.extend(batch)
+        if len(batch) < page_limit:
+            break
+        offset += page_limit
+    return all_leads
 
 
 def upsert_email_search_result(client: Client, place_id: str, email: str | None,
@@ -145,16 +174,26 @@ def upsert_email_search_result(client: Client, place_id: str, email: str | None,
 
 
 def get_leads_ready_for_instantly(client: Client, limit: int = 500) -> list[dict]:
-    """Golden leads with a found email that haven't been pushed to Instantly yet."""
-    resp = (
-        client.table("leads")
-        .select("*")
-        .not_.is_("contact_email", "null")
-        .eq("email_status", "not_started")
-        .limit(limit)
-        .execute()
-    )
-    return resp.data or []
+    """Golden leads with a found email that haven't been pushed to Instantly yet.
+    Paginated the same way as get_ungraded_leads -- see its docstring for why."""
+    all_leads: list[dict] = []
+    offset = 0
+    while len(all_leads) < limit:
+        page_limit = min(PAGE_SIZE, limit - len(all_leads))
+        resp = (
+            client.table("leads")
+            .select("*")
+            .not_.is_("contact_email", "null")
+            .eq("email_status", "not_started")
+            .range(offset, offset + page_limit - 1)
+            .execute()
+        )
+        batch = resp.data or []
+        all_leads.extend(batch)
+        if len(batch) < page_limit:
+            break
+        offset += page_limit
+    return all_leads
 
 
 def mark_lead_queued(client: Client, place_id: str, assigned_domain: str | None = None) -> None:
@@ -172,18 +211,30 @@ def mark_lead_push_failed(client: Client, place_id: str, note: str) -> None:
 
 def get_golden_leads(client: Client, min_rating: float, min_reviews: int) -> list[dict]:
     """Only returns leads that also have a phone number -- 'Active' was one of
-    the three original criteria, a lead you can't call isn't callable."""
-    resp = (
-        client.table("leads")
-        .select("*")
-        .eq("is_golden_lead", True)
-        .gte("rating", min_rating)
-        .gte("review_count", min_reviews)
-        .not_.is_("phone", "null")
-        .order("review_count", desc=True)
-        .execute()
-    )
-    return resp.data or []
+    the three original criteria, a lead you can't call isn't callable.
+    Paginated (no explicit cap here, but Supabase's server-side 1,000-row
+    default applies regardless of what we ask for -- this is what makes
+    `summary` actually show every golden lead instead of silently truncating)."""
+    all_leads: list[dict] = []
+    offset = 0
+    while True:
+        resp = (
+            client.table("leads")
+            .select("*")
+            .eq("is_golden_lead", True)
+            .gte("rating", min_rating)
+            .gte("review_count", min_reviews)
+            .not_.is_("phone", "null")
+            .order("review_count", desc=True)
+            .range(offset, offset + PAGE_SIZE - 1)
+            .execute()
+        )
+        batch = resp.data or []
+        all_leads.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+    return all_leads
 
 
 def update_reply_status(client: Client, place_id: str, status: str, notes: str | None = None) -> None:
