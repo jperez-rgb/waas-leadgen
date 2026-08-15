@@ -41,7 +41,7 @@ _progress_lock = threading.Lock()
 # memory growth (per-site renderer processes, caching) that only a fresh
 # browser process resets. Recycling periodically caps that growth instead of
 # letting it accumulate for the whole multi-day run.
-BROWSER_RECYCLE_EVERY = 200
+BROWSER_RECYCLE_EVERY = 50
 
 _thread_local = threading.local()
 
