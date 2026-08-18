@@ -16,14 +16,16 @@ from .site_grader import GradeResult
 
 logger = logging.getLogger(__name__)
 
-
-def _is_excluded(business_name: str) -> bool:
-    name_lower = business_name.lower()
-    return any(substr in name_lower for substr in EXCLUDED_NAME_SUBSTRINGS)
+PAGE_SIZE = 1000  # Supabase's own server-side cap, regardless of what limit we pass.
 
 
 def get_client(url: str, key: str) -> Client:
     return create_client(url, key)
+
+
+def _is_excluded(business_name: str) -> bool:
+    name_lower = business_name.lower()
+    return any(substr in name_lower for substr in EXCLUDED_NAME_SUBSTRINGS)
 
 
 def is_query_completed(client: Client, query: str) -> bool:
@@ -68,9 +70,6 @@ def upsert_place(client: Client, place: PlaceResult, city: str, county: str,
         "source_query": source_query,
         "niche": niche,
     }
-    # website_status only gets set to 'none' here if there's truly no website URL;
-    # otherwise leave it as whatever it already was (default 'unknown') so the
-    # grading step knows to pick it up.
     if not place.website_url:
         payload["website_status"] = "none"
         payload["website_notes"] = "No website listed on Google Business Profile."
@@ -78,7 +77,21 @@ def upsert_place(client: Client, place: PlaceResult, city: str, county: str,
     client.table("leads").upsert(payload, on_conflict="place_id").execute()
 
 
-PAGE_SIZE = 1000  # Supabase's own server-side cap, regardless of what limit we pass -- see functions below.
+def _apply_reputation_filter(query, min_rating: float, min_reviews: int):
+    """
+    Applies the rating/review-count filter ONLY when it would actually mean
+    something (> 0). This matters because of a real SQL gotcha: NULL >= 0
+    evaluates to NULL (not true) in Postgres, so a naive .gte("rating", 0)
+    silently EXCLUDES every lead where Google Places never returned a rating
+    at all (common for brand-new businesses with zero reviews) -- even though
+    min_rating=0 is supposed to mean "no filter, include everyone." Skipping
+    the filter entirely when the threshold is 0 avoids that trap.
+    """
+    if min_rating > 0:
+        query = query.gte("rating", min_rating)
+    if min_reviews > 0:
+        query = query.gte("review_count", min_reviews)
+    return query
 
 
 def get_ungraded_leads(client: Client, min_rating: float, min_reviews: int,
@@ -88,29 +101,25 @@ def get_ungraded_leads(client: Client, min_rating: float, min_reviews: int,
     a website we haven't visited yet, or no website at all (already gradeable
     without a visit, but we still want them flagged if somehow missed).
 
-    Paginates in pages of PAGE_SIZE. This matters regardless of Supabase's
-    project-level "Max Rows" setting: even with that raised, relying on a
-    single request to return an arbitrarily large `limit` is fragile -- this
-    makes the function actually return up to `limit` rows no matter what,
-    without depending on a dashboard setting staying configured correctly.
+    Paginates in pages of PAGE_SIZE -- Supabase's own server-side "Max Rows"
+    setting caps any single request regardless of what limit we pass, so this
+    loops with .range() until it actually has `limit` rows or runs out.
     """
     all_leads: list[dict] = []
     offset = 0
     while len(all_leads) < limit:
         page_limit = min(PAGE_SIZE, limit - len(all_leads))
-        resp = (
+        query = (
             client.table("leads")
             .select("*")
             .eq("website_status", "unknown")
-            .gte("rating", min_rating)
-            .gte("review_count", min_reviews)
-            .range(offset, offset + page_limit - 1)
-            .execute()
         )
+        query = _apply_reputation_filter(query, min_rating, min_reviews)
+        resp = query.range(offset, offset + page_limit - 1).execute()
         batch = resp.data or []
         all_leads.extend(batch)
         if len(batch) < page_limit:
-            break  # fewer rows than asked for -- we've hit the end of what matches
+            break
         offset += page_limit
     return all_leads
 
@@ -134,24 +143,22 @@ def get_bucket_a_leads_for_email_search(client: Client, min_rating: float, min_r
     haven't searched it yet. Excludes 'none'/'unreachable' entirely since those
     have no site to visit in the first place.
 
-    Paginated the same way as get_ungraded_leads -- see its docstring for why.
+    Paginated + null-safe reputation filter, same reasoning as get_ungraded_leads.
     """
     all_leads: list[dict] = []
     offset = 0
     while len(all_leads) < limit:
         page_limit = min(PAGE_SIZE, limit - len(all_leads))
-        resp = (
+        query = (
             client.table("leads")
             .select("*")
             .in_("website_status", ["thin", "outdated", "generic_builder"])
             .not_.is_("website_url", "null")
             .is_("email_searched_at", "null")
-            .gte("rating", min_rating)
-            .gte("review_count", min_reviews)
             .not_.is_("phone", "null")
-            .range(offset, offset + page_limit - 1)
-            .execute()
         )
+        query = _apply_reputation_filter(query, min_rating, min_reviews)
+        resp = query.range(offset, offset + page_limit - 1).execute()
         batch = resp.data or []
         all_leads.extend(batch)
         if len(batch) < page_limit:
@@ -174,8 +181,7 @@ def upsert_email_search_result(client: Client, place_id: str, email: str | None,
 
 
 def get_leads_ready_for_instantly(client: Client, limit: int = 500) -> list[dict]:
-    """Golden leads with a found email that haven't been pushed to Instantly yet.
-    Paginated the same way as get_ungraded_leads -- see its docstring for why."""
+    """Golden leads with a found email that haven't been pushed to Instantly yet."""
     all_leads: list[dict] = []
     offset = 0
     while len(all_leads) < limit:
@@ -211,24 +217,19 @@ def mark_lead_push_failed(client: Client, place_id: str, note: str) -> None:
 
 def get_golden_leads(client: Client, min_rating: float, min_reviews: int) -> list[dict]:
     """Only returns leads that also have a phone number -- 'Active' was one of
-    the three original criteria, a lead you can't call isn't callable.
-    Paginated (no explicit cap here, but Supabase's server-side 1,000-row
-    default applies regardless of what we ask for -- this is what makes
-    `summary` actually show every golden lead instead of silently truncating)."""
+    the three original criteria, a lead you can't call isn't callable."""
     all_leads: list[dict] = []
     offset = 0
     while True:
-        resp = (
+        query = (
             client.table("leads")
             .select("*")
             .eq("is_golden_lead", True)
-            .gte("rating", min_rating)
-            .gte("review_count", min_reviews)
             .not_.is_("phone", "null")
             .order("review_count", desc=True)
-            .range(offset, offset + PAGE_SIZE - 1)
-            .execute()
         )
+        query = _apply_reputation_filter(query, min_rating, min_reviews)
+        resp = query.range(offset, offset + PAGE_SIZE - 1).execute()
         batch = resp.data or []
         all_leads.extend(batch)
         if len(batch) < PAGE_SIZE:
@@ -238,13 +239,6 @@ def get_golden_leads(client: Client, min_rating: float, min_reviews: int) -> lis
 
 
 def update_reply_status(client: Client, place_id: str, status: str, notes: str | None = None) -> None:
-    """
-    status: one of 'no_reply', 'interested', 'not_interested', 'needs_followup',
-    'closed_won', 'closed_lost'. Call this whenever a lead replies to a cold email
-    so nothing gets lost -- there's no automatic reply detection here (that would
-    need an Instantly webhook, a future addition), this is meant to be updated
-    manually via a quick script or the Supabase table editor as replies come in.
-    """
     payload: dict = {"reply_status": status, "last_contacted_at": datetime.now(timezone.utc).isoformat()}
     if notes:
         payload["reply_notes"] = notes
@@ -257,9 +251,6 @@ def get_leads_by_reply_status(client: Client, status: str) -> list[dict]:
 
 
 def mark_unsubscribed(client: Client, email: str) -> None:
-    """Marks every lead row matching this email as unsubscribed. Wired to
-    Instantly's unsubscribe webhook eventually -- for now, callable manually
-    if someone emails back asking to be removed."""
     client.table("leads").update(
         {"unsubscribed": True, "email_status": "unsubscribed"}
     ).eq("contact_email", email).execute()
