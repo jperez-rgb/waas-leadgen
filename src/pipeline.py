@@ -1,11 +1,19 @@
 """
-Orchestrates the two phases of the Lead Generation Engine:
+Orchestrates the phases of the Lead Generation + Outreach Engine:
 
-  1. scrape  -- walk every (niche x city) combo in TARGET_AREAS, pull results
-                from Places API, upsert into Supabase.
-  2. grade   -- pull leads that clear the rating/review bar and haven't been
-                graded yet, visit each website with Playwright, classify it,
-                write the result back.
+  1. scrape        -- walk every (niche x city) combo, pull results from
+                       Places API, upsert into Supabase. Resumable at the
+                       query level (see scrape_progress table).
+  2. grade         -- visit each ungraded lead's website with Playwright,
+                       classify it. Parallelized across worker threads, each
+                       thread reusing (and periodically recycling) its own
+                       browser instance.
+  3. find-emails   -- for Bucket A leads (real, live website), scrape a
+                       published contact email off their site.
+  4. find-whois-emails -- for leads whose domain is dead ('unreachable'),
+                       try an RDAP/WHOIS lookup for a registrant email.
+                       No browser needed, lightweight HTTP only.
+  5. push-instantly -- push leads with a found email into an Instantly campaign.
 
 Run via run.py, not this file directly.
 """
@@ -26,21 +34,12 @@ from .instantly_client import InstantlyClient
 from .notify import notify
 from .places_client import PlacesClient
 from .site_grader import GradeResult, grade_website
+from .whois_finder import WhoisResult, find_whois_email
 
 logger = logging.getLogger(__name__)
 
-# Shared progress counter across worker threads. A plain int with a lock is
-# enough here -- we only need "how many done so far" for log lines, not
-# anything more sophisticated.
 _progress_lock = threading.Lock()
 
-# One Playwright browser per worker THREAD, recycled (closed + relaunched)
-# every BROWSER_RECYCLE_EVERY leads instead of kept alive for the entire run.
-# Reusing forever isn't enough on its own -- visiting thousands of *different*
-# websites in one long-lived Chromium process still causes gradual internal
-# memory growth (per-site renderer processes, caching) that only a fresh
-# browser process resets. Recycling periodically caps that growth instead of
-# letting it accumulate for the whole multi-day run.
 BROWSER_RECYCLE_EVERY = 50
 
 _thread_local = threading.local()
@@ -56,7 +55,7 @@ def _get_thread_browser():
             try:
                 _thread_local.browser.close()
                 _thread_local.playwright.stop()
-            except Exception:  # noqa: BLE001 -- best-effort cleanup, never let this crash the run
+            except Exception:
                 pass
         playwright = sync_playwright().start()
         _thread_local.playwright = playwright
@@ -67,14 +66,6 @@ def _get_thread_browser():
 
 
 def run_scrape(settings: Settings) -> None:
-    """
-    Resumable: before running each (niche, city) query, checks scrape_progress
-    to see if it already completed successfully in a prior run, and skips it
-    if so. This is what makes it safe (and cheap) to restart after a crash,
-    a Ctrl+C, or a Render redeploy -- without this, every restart would
-    silently re-burn Places API budget re-querying everything from the top,
-    even though the resulting rows wouldn't duplicate.
-    """
     client = db.get_client(settings.supabase_url, settings.supabase_key)
     places = PlacesClient(
         api_key=settings.google_places_api_key,
@@ -121,14 +112,12 @@ def run_scrape(settings: Settings) -> None:
 
 def _grade_one(lead: dict, settings: Settings) -> tuple[dict, GradeResult]:
     url = lead.get("website_url")
-    # Small random stagger even within a worker so N workers starting at once
-    # don't all fire their first request in the same instant.
     time.sleep(random.uniform(0, 1.5))
     try:
         browser = _get_thread_browser()
         grade = grade_website(url, screenshot_dir=settings.screenshot_dir,
                                timeout_ms=settings.site_grade_timeout_ms, browser=browser)
-    except Exception as exc:  # noqa: BLE001 -- a single site's quirks must never kill a multi-hour batch
+    except Exception as exc:
         logger.error("Unexpected error grading %s (%s): %s -- marking for manual review, continuing.",
                      lead.get("business_name"), url, exc)
         grade = GradeResult(
@@ -139,16 +128,6 @@ def _grade_one(lead: dict, settings: Settings) -> tuple[dict, GradeResult]:
 
 
 def run_grade(settings: Settings, max_leads: int | None = None) -> None:
-    """
-    Grades leads in parallel using a thread pool. Each worker thread launches
-    ONE Playwright browser and reuses it for every lead it processes (see
-    _get_thread_browser) -- not a fresh browser per lead. This is safe to
-    parallelize since each thread hits a *different* business's website (no
-    politeness concern running several at once). Worker count is tunable via
-    GRADE_WORKERS since the right number depends on the machine's CPU/memory
-    -- on a memory-constrained instance, keep this low (2-3); with more RAM,
-    4-8 is reasonable.
-    """
     client = db.get_client(settings.supabase_url, settings.supabase_key)
     leads = db.get_ungraded_leads(
         client, min_rating=settings.min_rating, min_reviews=settings.min_reviews,
@@ -186,7 +165,7 @@ def _find_email_one(lead: dict, settings: Settings) -> tuple[dict, EmailFindResu
     try:
         browser = _get_thread_browser()
         result = find_email(url, timeout_ms=settings.site_grade_timeout_ms, browser=browser)
-    except Exception as exc:  # noqa: BLE001 -- same reasoning as run_grade: never let one site kill the batch
+    except Exception as exc:
         logger.error("Unexpected error finding email on %s (%s): %s -- skipping, continuing.",
                      lead.get("business_name"), url, exc)
         result = EmailFindResult(
@@ -197,8 +176,6 @@ def _find_email_one(lead: dict, settings: Settings) -> tuple[dict, EmailFindResu
 
 
 def run_find_emails(settings: Settings, max_leads: int | None = None) -> None:
-    """Parallelized the same way as run_grade -- see its docstring for why
-    this is safe to run concurrently."""
     client = db.get_client(settings.supabase_url, settings.supabase_key)
     leads = db.get_bucket_a_leads_for_email_search(
         client, min_rating=settings.min_rating, min_reviews=settings.min_reviews,
@@ -233,6 +210,49 @@ def run_find_emails(settings: Settings, max_leads: int | None = None) -> None:
     notify(f"📧 Email search complete. Found {found_count}/{total} emails.")
 
 
+def _whois_one(lead: dict) -> tuple[dict, WhoisResult]:
+    time.sleep(random.uniform(0.3, 1.0))
+    try:
+        result = find_whois_email(lead.get("website_url"))
+    except Exception as exc:
+        logger.error("Unexpected error on WHOIS lookup for %s: %s -- skipping.",
+                     lead.get("business_name"), exc)
+        result = WhoisResult(email=None, confidence="none", notes=f"WHOIS crashed: {exc.__class__.__name__}")
+    return lead, result
+
+
+def run_find_whois_emails(settings: Settings, max_leads: int | None = None) -> None:
+    client = db.get_client(settings.supabase_url, settings.supabase_key)
+    leads = db.get_unreachable_leads_for_whois_search(client, limit=max_leads or 500)
+    total = len(leads)
+    logger.info("Running WHOIS/RDAP lookups on %d unreachable-domain leads", total)
+
+    found_count = 0
+    completed = 0
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(_whois_one, lead): lead for lead in leads}
+        for future in as_completed(futures):
+            lead, result = future.result()
+            db.upsert_email_search_result(
+                client, lead["place_id"], result.email, result.confidence,
+                lead.get("website_url"), result.notes,
+            )
+            if result.email:
+                found_count += 1
+
+            with _progress_lock:
+                completed += 1
+                current = completed
+
+            logger.info(
+                "[%d/%d] %s -> %s",
+                current, total, lead.get("business_name"), result.email or "NOT FOUND",
+            )
+
+    logger.info("WHOIS search complete. Found emails for %d/%d leads.", found_count, total)
+    notify(f"🔎 WHOIS search complete. Found {found_count}/{total} emails from dead domains.")
+
+
 def run_push_instantly(settings: Settings, api_key: str, campaign_id: str,
                         max_leads: int | None = None) -> None:
     client = db.get_client(settings.supabase_url, settings.supabase_key)
@@ -262,12 +282,11 @@ def run_push_instantly(settings: Settings, api_key: str, campaign_id: str,
             db.mark_lead_queued(client, lead["place_id"])
             pushed += 1
             logger.info("[%d/%d] Pushed %s (%s)", i, len(leads), lead.get("business_name"), lead["contact_email"])
-        except Exception as exc:  # noqa: BLE001 -- log and keep going, don't abort the whole batch
+        except Exception as exc:
             db.mark_lead_push_failed(client, lead["place_id"], f"Instantly push failed: {exc}")
             failed += 1
             logger.error("[%d/%d] FAILED to push %s: %s", i, len(leads), lead.get("business_name"), exc)
 
-        # Instantly's own rate limits apply -- be a little conservative.
         time.sleep(1.0)
 
     logger.info("Instantly push complete. Pushed: %d, Failed: %d", pushed, failed)

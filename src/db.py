@@ -80,10 +80,9 @@ def upsert_place(client: Client, place: PlaceResult, city: str, county: str,
 def _apply_reputation_filter(query, min_rating: float, min_reviews: int):
     """
     Applies the rating/review-count filter ONLY when it would actually mean
-    something (> 0). This matters because of a real SQL gotcha: NULL >= 0
-    evaluates to NULL (not true) in Postgres, so a naive .gte("rating", 0)
-    silently EXCLUDES every lead where Google Places never returned a rating
-    at all (common for brand-new businesses with zero reviews) -- even though
+    something (> 0). Real SQL gotcha: NULL >= 0 evaluates to NULL (not true)
+    in Postgres, so a naive .gte("rating", 0) silently EXCLUDES every lead
+    where Google Places never returned a rating at all -- even though
     min_rating=0 is supposed to mean "no filter, include everyone." Skipping
     the filter entirely when the threshold is 0 avoids that trap.
     """
@@ -141,7 +140,8 @@ def get_bucket_a_leads_for_email_search(client: Client, min_rating: float, min_r
     Bucket A: golden leads with an actual website worth scraping for an email --
     i.e. website_status is thin/outdated/generic_builder (has SOME url) and we
     haven't searched it yet. Excludes 'none'/'unreachable' entirely since those
-    have no site to visit in the first place.
+    have no site to visit in the first place (unreachable has a domain but it's
+    dead -- see get_unreachable_leads_for_whois_search for that bucket instead).
 
     Paginated + null-safe reputation filter, same reasoning as get_ungraded_leads.
     """
@@ -159,6 +159,36 @@ def get_bucket_a_leads_for_email_search(client: Client, min_rating: float, min_r
         )
         query = _apply_reputation_filter(query, min_rating, min_reviews)
         resp = query.range(offset, offset + page_limit - 1).execute()
+        batch = resp.data or []
+        all_leads.extend(batch)
+        if len(batch) < page_limit:
+            break
+        offset += page_limit
+    return all_leads
+
+
+def get_unreachable_leads_for_whois_search(client: Client, limit: int = 500) -> list[dict]:
+    """
+    Leads whose site is 'unreachable' (they own a domain, it's just currently
+    dead) and haven't had ANY email search attempted yet. Reuses the same
+    email_searched_at tracking column as the website-scrape email finder --
+    a lead only needs one email search logged, regardless of which method
+    (scraping their live site vs. a WHOIS/RDAP lookup on a dead one) was tried.
+    """
+    all_leads: list[dict] = []
+    offset = 0
+    while len(all_leads) < limit:
+        page_limit = min(PAGE_SIZE, limit - len(all_leads))
+        resp = (
+            client.table("leads")
+            .select("*")
+            .eq("website_status", "unreachable")
+            .not_.is_("website_url", "null")
+            .is_("email_searched_at", "null")
+            .not_.is_("phone", "null")
+            .range(offset, offset + page_limit - 1)
+            .execute()
+        )
         batch = resp.data or []
         all_leads.extend(batch)
         if len(batch) < page_limit:
