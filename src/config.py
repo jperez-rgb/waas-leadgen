@@ -416,3 +416,11 @@ NON_SCRAPABLE_EMAIL_HOSTS = [
     "business.site",
     "linktr.ee",
 ]
+
+
+def load_google_search_key() -> str:
+    return _require("GOOGLE_SEARCH_API_KEY")
+
+
+def load_google_search_cx() -> str:
+    return _require("GOOGLE_SEARCH_CX")

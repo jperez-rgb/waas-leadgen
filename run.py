@@ -8,6 +8,7 @@ Usage:
     python run.py grade --limit 50      # grade only the next 50 (useful for testing)
     python run.py find-emails           # scrape Bucket A leads' sites for a contact email
     python run.py find-whois-emails     # RDAP/WHOIS lookup for leads with dead domains
+    python run.py find-snippet-emails   # Google Custom Search snippet lookup for remaining leads
     python run.py push-instantly        # push leads with a found email into your Instantly campaign
     python run.py summary               # print current golden leads from the DB
     python run.py mark-reply --email x@y.com --status interested --notes "wants a call"
@@ -20,10 +21,17 @@ import logging
 import sys
 
 from src import db
-from src.config import load_instantly_campaign_id, load_instantly_key, load_settings
+from src.config import (
+    load_google_search_cx,
+    load_google_search_key,
+    load_instantly_campaign_id,
+    load_instantly_key,
+    load_settings,
+)
 from src.pipeline import (
     print_golden_leads_summary,
     run_find_emails,
+    run_find_snippet_emails,
     run_find_whois_emails,
     run_grade,
     run_push_instantly,
@@ -42,13 +50,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="WaaS Agency Lead Generation + Outreach Engine")
     parser.add_argument(
         "command",
-        choices=["scrape", "grade", "find-emails", "find-whois-emails", "push-instantly",
-                 "summary", "mark-reply", "all"],
+        choices=["scrape", "grade", "find-emails", "find-whois-emails", "find-snippet-emails",
+                 "push-instantly", "summary", "mark-reply", "all"],
         help="Which phase to run.",
     )
     parser.add_argument(
         "--limit", type=int, default=None,
-        help="Max leads to process in this run (grade/find-emails/find-whois-emails/push-instantly commands).",
+        help="Max leads to process in this run.",
     )
     parser.add_argument("--email", type=str, default=None, help="Lead's email (mark-reply command).")
     parser.add_argument("--status", type=str, choices=REPLY_STATUSES, default=None,
@@ -66,6 +74,10 @@ def main() -> int:
         run_find_emails(settings, max_leads=args.limit)
     if args.command == "find-whois-emails":
         run_find_whois_emails(settings, max_leads=args.limit)
+    if args.command == "find-snippet-emails":
+        google_search_key = load_google_search_key()
+        google_search_cx = load_google_search_cx()
+        run_find_snippet_emails(google_search_key, google_search_cx, settings, max_leads=args.limit)
     if args.command == "push-instantly":
         api_key = load_instantly_key()
         campaign_id = load_instantly_campaign_id()

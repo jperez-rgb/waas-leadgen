@@ -171,9 +171,7 @@ def get_unreachable_leads_for_whois_search(client: Client, limit: int = 500) -> 
     """
     Leads whose site is 'unreachable' (they own a domain, it's just currently
     dead) and haven't had ANY email search attempted yet. Reuses the same
-    email_searched_at tracking column as the website-scrape email finder --
-    a lead only needs one email search logged, regardless of which method
-    (scraping their live site vs. a WHOIS/RDAP lookup on a dead one) was tried.
+    email_searched_at tracking column as the website-scrape email finder.
     """
     all_leads: list[dict] = []
     offset = 0
@@ -185,6 +183,35 @@ def get_unreachable_leads_for_whois_search(client: Client, limit: int = 500) -> 
             .eq("website_status", "unreachable")
             .not_.is_("website_url", "null")
             .is_("email_searched_at", "null")
+            .not_.is_("phone", "null")
+            .range(offset, offset + page_limit - 1)
+            .execute()
+        )
+        batch = resp.data or []
+        all_leads.extend(batch)
+        if len(batch) < page_limit:
+            break
+        offset += page_limit
+    return all_leads
+
+
+def get_leads_for_snippet_search(client: Client, limit: int = 500) -> list[dict]:
+    """
+    Leads with 'none' or 'unreachable' status that STILL have no contact_email
+    after every other method has had its shot. Filters on contact_email being
+    null directly, rather than email_searched_at, since a lead may already
+    have been "searched" once via WHOIS and we want to give it a second,
+    different method rather than skip it as already-tried.
+    """
+    all_leads: list[dict] = []
+    offset = 0
+    while len(all_leads) < limit:
+        page_limit = min(PAGE_SIZE, limit - len(all_leads))
+        resp = (
+            client.table("leads")
+            .select("*")
+            .in_("website_status", ["none", "unreachable"])
+            .is_("contact_email", "null")
             .not_.is_("phone", "null")
             .range(offset, offset + page_limit - 1)
             .execute()

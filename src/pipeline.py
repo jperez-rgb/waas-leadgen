@@ -1,19 +1,20 @@
 """
 Orchestrates the phases of the Lead Generation + Outreach Engine:
 
-  1. scrape        -- walk every (niche x city) combo, pull results from
-                       Places API, upsert into Supabase. Resumable at the
-                       query level (see scrape_progress table).
-  2. grade         -- visit each ungraded lead's website with Playwright,
-                       classify it. Parallelized across worker threads, each
-                       thread reusing (and periodically recycling) its own
-                       browser instance.
-  3. find-emails   -- for Bucket A leads (real, live website), scrape a
-                       published contact email off their site.
-  4. find-whois-emails -- for leads whose domain is dead ('unreachable'),
-                       try an RDAP/WHOIS lookup for a registrant email.
-                       No browser needed, lightweight HTTP only.
-  5. push-instantly -- push leads with a found email into an Instantly campaign.
+  1. scrape             -- walk every (niche x city) combo, pull results from
+                            Places API, upsert into Supabase. Resumable at the
+                            query level (see scrape_progress table).
+  2. grade              -- visit each ungraded lead's website with Playwright,
+                            classify it. Parallelized across worker threads,
+                            each thread reusing/recycling its own browser.
+  3. find-emails        -- for Bucket A leads (real, live website), scrape a
+                            published contact email off their site.
+  4. find-whois-emails  -- for leads whose domain is dead ('unreachable'),
+                            try an RDAP/WHOIS lookup for a registrant email.
+  5. find-snippet-emails -- for leads with no website (or dead domain) still
+                            missing an email, search Google Custom Search and
+                            scan only the returned snippet text for an email.
+  6. push-instantly     -- push leads with a found email into an Instantly campaign.
 
 Run via run.py, not this file directly.
 """
@@ -34,6 +35,7 @@ from .instantly_client import InstantlyClient
 from .notify import notify
 from .places_client import PlacesClient
 from .site_grader import GradeResult, grade_website
+from .snippet_search_finder import GoogleSnippetFinder, SnippetSearchResult
 from .whois_finder import WhoisResult, find_whois_email
 
 logger = logging.getLogger(__name__)
@@ -251,6 +253,61 @@ def run_find_whois_emails(settings: Settings, max_leads: int | None = None) -> N
 
     logger.info("WHOIS search complete. Found emails for %d/%d leads.", found_count, total)
     notify(f"🔎 WHOIS search complete. Found {found_count}/{total} emails from dead domains.")
+
+
+def _snippet_one(lead: dict, finder: GoogleSnippetFinder) -> tuple[dict, SnippetSearchResult]:
+    time.sleep(random.uniform(0.5, 1.5))
+    try:
+        result = finder.find_email(lead.get("business_name", ""), lead.get("city", ""))
+    except Exception as exc:
+        logger.error("Unexpected error on snippet search for %s: %s -- skipping.",
+                     lead.get("business_name"), exc)
+        result = SnippetSearchResult(email=None, confidence="none", source_url=None,
+                                      notes=f"Snippet search crashed: {exc.__class__.__name__}")
+    return lead, result
+
+
+def run_find_snippet_emails(google_search_key: str, google_search_cx: str,
+                             settings: Settings, max_leads: int | None = None) -> None:
+    """
+    For leads with no website at all, or a dead one, searches Google's Custom
+    Search API for their business name + city and scans only the returned
+    SNIPPET TEXT for a published email -- never fetches third-party pages
+    directly. Costs ~$5/1,000 queries after a small free tier.
+    """
+    client = db.get_client(settings.supabase_url, settings.supabase_key)
+    leads = db.get_leads_for_snippet_search(client, limit=max_leads or 500)
+    total = len(leads)
+    logger.info("Running Google snippet searches on %d leads with no confirmed email "
+                "(estimated cost: ~$%.2f at $5/1000 queries)", total, total * 0.005)
+
+    finder = GoogleSnippetFinder(google_search_key, google_search_cx)
+
+    found_count = 0
+    completed = 0
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(_snippet_one, lead, finder): lead for lead in leads}
+        for future in as_completed(futures):
+            lead, result = future.result()
+            db.upsert_email_search_result(
+                client, lead["place_id"], result.email, result.confidence,
+                result.source_url, result.notes,
+            )
+            if result.email:
+                found_count += 1
+
+            with _progress_lock:
+                completed += 1
+                current = completed
+
+            logger.info(
+                "[%d/%d] %s -> %s",
+                current, total, lead.get("business_name"), result.email or "NOT FOUND",
+            )
+
+    logger.info("Snippet search complete. Found %d/%d emails. Actual cost: ~$%.2f",
+                found_count, total, total * 0.005)
+    notify(f"🔍 Snippet search complete. Found {found_count}/{total} emails. Cost: ~${total * 0.005:.2f}")
 
 
 def run_push_instantly(settings: Settings, api_key: str, campaign_id: str,
