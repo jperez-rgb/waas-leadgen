@@ -9,6 +9,11 @@ API's own output sidesteps that entirely).
 
 Cost: $0.30 per 1,000 queries (Searlo pricing as of setup time -- confirm
 current pricing before a large run, since third-party API pricing can change).
+
+Endpoint/response format confirmed live on 2026-08-20: GET /api/v1/search
+returns results under "organic", each with "title"/"link"/"snippet" fields
+(their docs showed a different, incorrect shape elsewhere -- this is what's
+actually live).
 """
 from __future__ import annotations
 
@@ -21,7 +26,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 logger = logging.getLogger(__name__)
 
-SEARCH_URL = "https://api.searlo.tech/v1/search/web"
+SEARCH_URL = "https://api.searlo.tech/api/v1/search"
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
@@ -52,12 +57,6 @@ def _clean_candidates(raw_emails: list[str]) -> list[str]:
 
 
 class GoogleSnippetFinder:
-    """
-    Name kept as-is (rather than renamed) so pipeline.py's existing call
-    sites don't need touching beyond the constructor args -- this class just
-    searches the web now via a different backend (Searlo, not Google).
-    """
-
     def __init__(self, api_key: str):
         self._api_key = api_key
 
@@ -89,15 +88,15 @@ class GoogleSnippetFinder:
                 notes=f"Search API call failed: {exc.__class__.__name__}",
             )
 
-        results = data.get("results", [])
+        results = data.get("organic", [])
         for item in results:
-            text_blob = " ".join([item.get("title", ""), item.get("description", "")])
+            text_blob = " ".join([item.get("title", ""), item.get("snippet", "")])
             candidates = _clean_candidates(EMAIL_RE.findall(text_blob))
             if candidates:
                 return SnippetSearchResult(
                     email=candidates[0], confidence="search_snippet",
-                    source_url=item.get("url"),
-                    notes=f"Found in search snippet for {item.get('url', 'unknown source')}.",
+                    source_url=item.get("link"),
+                    notes=f"Found in search snippet for {item.get('link', 'unknown source')}.",
                 )
 
         return SnippetSearchResult(
