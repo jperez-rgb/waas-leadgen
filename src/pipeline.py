@@ -14,6 +14,10 @@ Orchestrates the phases of the Lead Generation + Outreach Engine:
   5. find-snippet-emails -- for leads with no website (or dead domain) still
                             missing an email, search Google Custom Search and
                             scan only the returned snippet text for an email.
+                            Run sequentially -- Google caps at 100 queries/min
+                            PER USER, and concurrent workers burst past that
+                            shared bucket even though the project quota looks
+                            unlimited.
   6. push-instantly     -- push leads with a found email into an Instantly campaign.
 
 Run via run.py, not this file directly.
@@ -256,7 +260,6 @@ def run_find_whois_emails(settings: Settings, max_leads: int | None = None) -> N
 
 
 def _snippet_one(lead: dict, finder: GoogleSnippetFinder) -> tuple[dict, SnippetSearchResult]:
-    time.sleep(random.uniform(0.5, 1.5))
     try:
         result = finder.find_email(lead.get("business_name", ""), lead.get("city", ""))
     except Exception as exc:
@@ -270,10 +273,12 @@ def _snippet_one(lead: dict, finder: GoogleSnippetFinder) -> tuple[dict, Snippet
 def run_find_snippet_emails(google_search_key: str, google_search_cx: str,
                              settings: Settings, max_leads: int | None = None) -> None:
     """
-    For leads with no website at all, or a dead one, searches Google's Custom
-    Search API for their business name + city and scans only the returned
-    SNIPPET TEXT for a published email -- never fetches third-party pages
-    directly. Costs ~$5/1,000 queries after a small free tier.
+    IMPORTANT: Google's Custom Search API caps at 100 queries/minute PER USER --
+    a separate, stricter limit than the overall per-project quota. Since a
+    single API key with no per-request user identifier is treated as one
+    "user," concurrent workers burst past that shared bucket even though the
+    project-level quota looks unlimited. Run strictly sequentially (no thread
+    pool) with a fixed delay between calls to stay safely under it.
     """
     client = db.get_client(settings.supabase_url, settings.supabase_key)
     leads = db.get_leads_for_snippet_search(client, limit=max_leads or 500)
@@ -284,26 +289,22 @@ def run_find_snippet_emails(google_search_key: str, google_search_cx: str,
     finder = GoogleSnippetFinder(google_search_key, google_search_cx)
 
     found_count = 0
-    completed = 0
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {pool.submit(_snippet_one, lead, finder): lead for lead in leads}
-        for future in as_completed(futures):
-            lead, result = future.result()
-            db.upsert_email_search_result(
-                client, lead["place_id"], result.email, result.confidence,
-                result.source_url, result.notes,
-            )
-            if result.email:
-                found_count += 1
+    delay_seconds = 0.8  # 75 requests/minute, safely under the 100/min per-user cap.
 
-            with _progress_lock:
-                completed += 1
-                current = completed
+    for i, lead in enumerate(leads, start=1):
+        lead, result = _snippet_one(lead, finder)
+        db.upsert_email_search_result(
+            client, lead["place_id"], result.email, result.confidence,
+            result.source_url, result.notes,
+        )
+        if result.email:
+            found_count += 1
 
-            logger.info(
-                "[%d/%d] %s -> %s",
-                current, total, lead.get("business_name"), result.email or "NOT FOUND",
-            )
+        logger.info(
+            "[%d/%d] %s -> %s",
+            i, total, lead.get("business_name"), result.email or "NOT FOUND",
+        )
+        time.sleep(delay_seconds)
 
     logger.info("Snippet search complete. Found %d/%d emails. Actual cost: ~$%.2f",
                 found_count, total, total * 0.005)
