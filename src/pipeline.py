@@ -12,12 +12,9 @@ Orchestrates the phases of the Lead Generation + Outreach Engine:
   4. find-whois-emails  -- for leads whose domain is dead ('unreachable'),
                             try an RDAP/WHOIS lookup for a registrant email.
   5. find-snippet-emails -- for leads with no website (or dead domain) still
-                            missing an email, search Google Custom Search and
-                            scan only the returned snippet text for an email.
-                            Run sequentially -- Google caps at 100 queries/min
-                            PER USER, and concurrent workers burst past that
-                            shared bucket even though the project quota looks
-                            unlimited.
+                            missing an email, search via Searlo and scan only
+                            the returned snippet text for an email. Runs
+                            sequentially with a conservative delay.
   6. push-instantly     -- push leads with a found email into an Instantly campaign.
 
 Run via run.py, not this file directly.
@@ -270,26 +267,32 @@ def _snippet_one(lead: dict, finder: GoogleSnippetFinder) -> tuple[dict, Snippet
     return lead, result
 
 
-def run_find_snippet_emails(google_search_key: str, google_search_cx: str,
+def run_find_snippet_emails(searlo_api_key: str,
                              settings: Settings, max_leads: int | None = None) -> None:
     """
-    IMPORTANT: Google's Custom Search API caps at 100 queries/minute PER USER --
-    a separate, stricter limit than the overall per-project quota. Since a
-    single API key with no per-request user identifier is treated as one
-    "user," concurrent workers burst past that shared bucket even though the
-    project-level quota looks unlimited. Run strictly sequentially (no thread
-    pool) with a fixed delay between calls to stay safely under it.
+    For leads with no website at all, or a dead one, searches the web via
+    Searlo (chosen after Google's Custom Search JSON API turned out to be
+    closed to new customers) for their business name + city and scans only
+    the returned SNIPPET TEXT for a published email -- never fetches
+    third-party pages directly, since directory sites (Yelp, BBB, etc.) have
+    their own ToS around automated scraping. Costs ~$0.30/1,000 queries
+    (Searlo pricing at setup time -- verify current pricing before a big
+    run). Expect a modest hit rate -- most snippets show phone/hours, not email.
+
+    Runs sequentially with a conservative delay between calls, since Searlo's
+    exact rate limits weren't verified before this was built -- start
+    cautious, then increase speed once a real run confirms no 429s.
     """
     client = db.get_client(settings.supabase_url, settings.supabase_key)
     leads = db.get_leads_for_snippet_search(client, limit=max_leads or 500)
     total = len(leads)
-    logger.info("Running Google snippet searches on %d leads with no confirmed email "
-                "(estimated cost: ~$%.2f at $5/1000 queries)", total, total * 0.005)
+    logger.info("Running snippet searches on %d leads with no confirmed email "
+                "(estimated cost: ~$%.2f at $0.30/1000 queries)", total, total * 0.0003)
 
-    finder = GoogleSnippetFinder(google_search_key, google_search_cx)
+    finder = GoogleSnippetFinder(searlo_api_key)
 
     found_count = 0
-    delay_seconds = 0.8  # 75 requests/minute, safely under the 100/min per-user cap.
+    delay_seconds = 0.3  # conservative starting point -- tune up if no 429s appear
 
     for i, lead in enumerate(leads, start=1):
         lead, result = _snippet_one(lead, finder)
@@ -307,8 +310,8 @@ def run_find_snippet_emails(google_search_key: str, google_search_cx: str,
         time.sleep(delay_seconds)
 
     logger.info("Snippet search complete. Found %d/%d emails. Actual cost: ~$%.2f",
-                found_count, total, total * 0.005)
-    notify(f"🔍 Snippet search complete. Found {found_count}/{total} emails. Cost: ~${total * 0.005:.2f}")
+                found_count, total, total * 0.0003)
+    notify(f"🔍 Snippet search complete. Found {found_count}/{total} emails. Cost: ~${total * 0.0003:.2f}")
 
 
 def run_push_instantly(settings: Settings, api_key: str, campaign_id: str,

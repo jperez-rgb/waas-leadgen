@@ -8,7 +8,7 @@ Usage:
     python run.py grade --limit 50      # grade only the next 50 (useful for testing)
     python run.py find-emails           # scrape Bucket A leads' sites for a contact email
     python run.py find-whois-emails     # RDAP/WHOIS lookup for leads with dead domains
-    python run.py find-snippet-emails   # Google Custom Search snippet lookup for remaining leads
+    python run.py find-snippet-emails   # Searlo web search snippet lookup for remaining leads
     python run.py push-instantly        # push leads with a found email into your Instantly campaign
     python run.py summary               # print current golden leads from the DB
     python run.py mark-reply --email x@y.com --status interested --notes "wants a call"
@@ -22,10 +22,9 @@ import sys
 
 from src import db
 from src.config import (
-    load_google_search_cx,
-    load_google_search_key,
     load_instantly_campaign_id,
     load_instantly_key,
+    load_searlo_key,
     load_settings,
 )
 from src.pipeline import (
@@ -75,9 +74,8 @@ def main() -> int:
     if args.command == "find-whois-emails":
         run_find_whois_emails(settings, max_leads=args.limit)
     if args.command == "find-snippet-emails":
-        google_search_key = load_google_search_key()
-        google_search_cx = load_google_search_cx()
-        run_find_snippet_emails(google_search_key, google_search_cx, settings, max_leads=args.limit)
+        searlo_api_key = load_searlo_key()
+        run_find_snippet_emails(searlo_api_key, settings, max_leads=args.limit)
     if args.command == "push-instantly":
         api_key = load_instantly_key()
         campaign_id = load_instantly_campaign_id()

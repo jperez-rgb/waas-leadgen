@@ -1,15 +1,14 @@
 """
-For leads with no website (or a dead one), searches Google via the Custom
-Search JSON API for their business name + city, and scans the returned
-SNIPPET TEXT ONLY for a published email -- never fetches or scrapes the
-actual destination pages (directories, Yelp, BBB, etc. all have their own
-ToS around automated access; consuming Google's own search API output
-sidesteps that entirely, since we're reading what Google chose to show in
-its own result preview, not scraping a third-party site ourselves).
+For leads with no website (or a dead one), searches the web via Searlo
+(https://searlo.tech -- a SERP API, chosen after discovering Google's Custom
+Search JSON API is closed to new customers as of 2025) for their business
+name + city, and scans the returned SNIPPET TEXT ONLY for a published email --
+never fetches or scrapes the actual destination pages (directories, Yelp,
+BBB, etc. all have their own ToS around automated access; consuming a search
+API's own output sidesteps that entirely).
 
-Cost: ~$5 per 1,000 queries after a small daily free tier. Expect a modest,
-not high, hit rate -- most business listings show phone/address/hours in
-their snippet, not email.
+Cost: $0.30 per 1,000 queries (Searlo pricing as of setup time -- confirm
+current pricing before a large run, since third-party API pricing can change).
 """
 from __future__ import annotations
 
@@ -22,7 +21,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 logger = logging.getLogger(__name__)
 
-SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
+SEARCH_URL = "https://api.searlo.tech/v1/search/web"
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
@@ -53,9 +52,14 @@ def _clean_candidates(raw_emails: list[str]) -> list[str]:
 
 
 class GoogleSnippetFinder:
-    def __init__(self, api_key: str, cx: str):
+    """
+    Name kept as-is (rather than renamed) so pipeline.py's existing call
+    sites don't need touching beyond the constructor args -- this class just
+    searches the web now via a different backend (Searlo, not Google).
+    """
+
+    def __init__(self, api_key: str):
         self._api_key = api_key
-        self._cx = cx
 
     @retry(
         reraise=True,
@@ -66,7 +70,8 @@ class GoogleSnippetFinder:
     def _search(self, query: str) -> dict:
         resp = requests.get(
             SEARCH_URL,
-            params={"key": self._api_key, "cx": self._cx, "q": query, "num": 10},
+            headers={"X-API-Key": self._api_key},
+            params={"q": query},
             timeout=15,
         )
         if resp.status_code == 429:
@@ -84,22 +89,18 @@ class GoogleSnippetFinder:
                 notes=f"Search API call failed: {exc.__class__.__name__}",
             )
 
-        items = data.get("items", [])
-        for item in items:
-            text_blob = " ".join([
-                item.get("title", ""),
-                item.get("snippet", ""),
-                item.get("displayLink", ""),
-            ])
+        results = data.get("results", [])
+        for item in results:
+            text_blob = " ".join([item.get("title", ""), item.get("description", "")])
             candidates = _clean_candidates(EMAIL_RE.findall(text_blob))
             if candidates:
                 return SnippetSearchResult(
                     email=candidates[0], confidence="search_snippet",
-                    source_url=item.get("link"),
-                    notes=f"Found in Google search snippet for {item.get('displayLink', 'unknown source')}.",
+                    source_url=item.get("url"),
+                    notes=f"Found in search snippet for {item.get('url', 'unknown source')}.",
                 )
 
         return SnippetSearchResult(
             email=None, confidence="none", source_url=None,
-            notes=f"No email found in top {len(items)} search snippets.",
+            notes=f"No email found in top {len(results)} search results.",
         )

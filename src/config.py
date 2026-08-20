@@ -424,3 +424,7 @@ def load_google_search_key() -> str:
 
 def load_google_search_cx() -> str:
     return _require("GOOGLE_SEARCH_CX")
+
+
+def load_searlo_key() -> str:
+    return _require("SEARLO_API_KEY")
