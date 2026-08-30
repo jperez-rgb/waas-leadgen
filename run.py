@@ -4,11 +4,11 @@ CLI entry point for the Lead Generation Engine + Outreach Pipeline.
 
 Usage:
     python run.py scrape                # pull fresh leads from Places API into Supabase
+    python run.py scrape-laas            # scrape LaaS-specific niches (web/marketing agencies)
     python run.py grade                 # visit + classify websites for ungraded leads
     python run.py grade --limit 50      # grade only the next 50 (useful for testing)
     python run.py find-emails           # scrape Bucket A leads' sites for a contact email
     python run.py find-whois-emails     # RDAP/WHOIS lookup for leads with dead domains
-    python run.py find-snippet-emails   # Searlo web search snippet lookup for remaining leads
     python run.py push-instantly        # push leads with a found email into your Instantly campaign
     python run.py summary               # print current golden leads from the DB
     python run.py mark-reply --email x@y.com --status interested --notes "wants a call"
@@ -22,9 +22,10 @@ import sys
 
 from src import db
 from src.config import (
+    LAAS_NICHES,
+    load_searlo_key,
     load_instantly_campaign_id,
     load_instantly_key,
-    load_searlo_key,
     load_settings,
 )
 from src.pipeline import (
@@ -49,13 +50,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="WaaS Agency Lead Generation + Outreach Engine")
     parser.add_argument(
         "command",
-        choices=["scrape", "grade", "find-emails", "find-whois-emails", "find-snippet-emails",
+        choices=["scrape", "scrape-laas", "grade", "find-emails", "find-whois-emails", "find-snippet-emails",
                  "push-instantly", "summary", "mark-reply", "all"],
         help="Which phase to run.",
     )
     parser.add_argument(
         "--limit", type=int, default=None,
-        help="Max leads to process in this run.",
+        help="Max leads to process in this run (grade/find-emails/find-whois-emails/push-instantly commands).",
     )
     parser.add_argument("--email", type=str, default=None, help="Lead's email (mark-reply command).")
     parser.add_argument("--status", type=str, choices=REPLY_STATUSES, default=None,
@@ -67,6 +68,8 @@ def main() -> int:
 
     if args.command in ("scrape", "all"):
         run_scrape(settings)
+    if args.command == "scrape-laas":
+        run_scrape(settings, niches=LAAS_NICHES)
     if args.command in ("grade", "all"):
         run_grade(settings, max_leads=args.limit)
     if args.command == "find-emails":

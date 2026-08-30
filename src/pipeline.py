@@ -1,22 +1,5 @@
 """
-Orchestrates the phases of the Lead Generation + Outreach Engine:
-
-  1. scrape             -- walk every (niche x city) combo, pull results from
-                            Places API, upsert into Supabase. Resumable at the
-                            query level (see scrape_progress table).
-  2. grade              -- visit each ungraded lead's website with Playwright,
-                            classify it. Parallelized across worker threads,
-                            each thread reusing/recycling its own browser.
-  3. find-emails        -- for Bucket A leads (real, live website), scrape a
-                            published contact email off their site.
-  4. find-whois-emails  -- for leads whose domain is dead ('unreachable'),
-                            try an RDAP/WHOIS lookup for a registrant email.
-  5. find-snippet-emails -- for leads with no website (or dead domain) still
-                            missing an email, search via Searlo and scan only
-                            the returned snippet text for an email. Runs
-                            sequentially with a conservative delay.
-  6. push-instantly     -- push leads with a found email into an Instantly campaign.
-
+Orchestrates the phases of the Lead Generation + Outreach Engine.
 Run via run.py, not this file directly.
 """
 from __future__ import annotations
@@ -68,20 +51,26 @@ def _get_thread_browser():
     return _thread_local.browser
 
 
-def run_scrape(settings: Settings) -> None:
+def run_scrape(settings: Settings, niches: list[tuple[str, str]] | None = None) -> None:
+    """
+    `niches` defaults to the main NICHES list (JoshWeb's own service niches)
+    if not provided -- pass LAAS_NICHES to run a separate scrape for the
+    JoshWeb Leads product line without touching JoshWeb's own target niches.
+    """
+    active_niches = niches if niches is not None else NICHES
     client = db.get_client(settings.supabase_url, settings.supabase_key)
     places = PlacesClient(
         api_key=settings.google_places_api_key,
         requests_per_minute=settings.places_requests_per_minute,
     )
 
-    total_queries = len(TARGET_AREAS) * len(NICHES)
+    total_queries = len(TARGET_AREAS) * len(active_niches)
     total_upserted = 0
     skipped = 0
     query_num = 0
 
     for query_fragment, city, county in TARGET_AREAS:
-        for niche_label, niche_key in NICHES:
+        for niche_label, niche_key in active_niches:
             query_num += 1
             query = f"{niche_label} in {query_fragment}"
 
@@ -109,7 +98,7 @@ def run_scrape(settings: Settings) -> None:
     )
     notify(
         f"🔍 Scrape phase complete. {total_upserted} leads upserted "
-        f"({skipped} queries skipped as already done) across {len(TARGET_AREAS)} cities × {len(NICHES)} niches."
+        f"({skipped} queries skipped as already done) across {len(TARGET_AREAS)} cities × {len(active_niches)} niches."
     )
 
 
@@ -269,20 +258,6 @@ def _snippet_one(lead: dict, finder: GoogleSnippetFinder) -> tuple[dict, Snippet
 
 def run_find_snippet_emails(searlo_api_key: str,
                              settings: Settings, max_leads: int | None = None) -> None:
-    """
-    For leads with no website at all, or a dead one, searches the web via
-    Searlo (chosen after Google's Custom Search JSON API turned out to be
-    closed to new customers) for their business name + city and scans only
-    the returned SNIPPET TEXT for a published email -- never fetches
-    third-party pages directly, since directory sites (Yelp, BBB, etc.) have
-    their own ToS around automated scraping. Costs ~$0.30/1,000 queries
-    (Searlo pricing at setup time -- verify current pricing before a big
-    run). Expect a modest hit rate -- most snippets show phone/hours, not email.
-
-    Runs sequentially with a conservative delay between calls, since Searlo's
-    exact rate limits weren't verified before this was built -- start
-    cautious, then increase speed once a real run confirms no 429s.
-    """
     client = db.get_client(settings.supabase_url, settings.supabase_key)
     leads = db.get_leads_for_snippet_search(client, limit=max_leads or 500)
     total = len(leads)
@@ -292,7 +267,7 @@ def run_find_snippet_emails(searlo_api_key: str,
     finder = GoogleSnippetFinder(searlo_api_key)
 
     found_count = 0
-    delay_seconds = 0.3  # conservative starting point -- tune up if no 429s appear
+    delay_seconds = 0.3
 
     for i, lead in enumerate(leads, start=1):
         lead, result = _snippet_one(lead, finder)

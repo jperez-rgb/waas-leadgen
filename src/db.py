@@ -95,15 +95,6 @@ def _apply_reputation_filter(query, min_rating: float, min_reviews: int):
 
 def get_ungraded_leads(client: Client, min_rating: float, min_reviews: int,
                         limit: int = 500) -> list[dict]:
-    """
-    Leads that meet the reputation bar (rating/review count) and either have
-    a website we haven't visited yet, or no website at all (already gradeable
-    without a visit, but we still want them flagged if somehow missed).
-
-    Paginates in pages of PAGE_SIZE -- Supabase's own server-side "Max Rows"
-    setting caps any single request regardless of what limit we pass, so this
-    loops with .range() until it actually has `limit` rows or runs out.
-    """
     all_leads: list[dict] = []
     offset = 0
     while len(all_leads) < limit:
@@ -136,15 +127,6 @@ def upsert_grade(client: Client, place_id: str, grade: GradeResult) -> None:
 
 def get_bucket_a_leads_for_email_search(client: Client, min_rating: float, min_reviews: int,
                                           limit: int = 500) -> list[dict]:
-    """
-    Bucket A: golden leads with an actual website worth scraping for an email --
-    i.e. website_status is thin/outdated/generic_builder (has SOME url) and we
-    haven't searched it yet. Excludes 'none'/'unreachable' entirely since those
-    have no site to visit in the first place (unreachable has a domain but it's
-    dead -- see get_unreachable_leads_for_whois_search for that bucket instead).
-
-    Paginated + null-safe reputation filter, same reasoning as get_ungraded_leads.
-    """
     all_leads: list[dict] = []
     offset = 0
     while len(all_leads) < limit:
@@ -168,11 +150,6 @@ def get_bucket_a_leads_for_email_search(client: Client, min_rating: float, min_r
 
 
 def get_unreachable_leads_for_whois_search(client: Client, limit: int = 500) -> list[dict]:
-    """
-    Leads whose site is 'unreachable' (they own a domain, it's just currently
-    dead) and haven't had ANY email search attempted yet. Reuses the same
-    email_searched_at tracking column as the website-scrape email finder.
-    """
     all_leads: list[dict] = []
     offset = 0
     while len(all_leads) < limit:
@@ -196,13 +173,6 @@ def get_unreachable_leads_for_whois_search(client: Client, limit: int = 500) -> 
 
 
 def get_leads_for_snippet_search(client: Client, limit: int = 500) -> list[dict]:
-    """
-    Leads with 'none' or 'unreachable' status that STILL have no contact_email
-    after every other method has had its shot. Filters on contact_email being
-    null directly, rather than email_searched_at, since a lead may already
-    have been "searched" once via WHOIS and we want to give it a second,
-    different method rather than skip it as already-tried.
-    """
     all_leads: list[dict] = []
     offset = 0
     while len(all_leads) < limit:
@@ -238,7 +208,6 @@ def upsert_email_search_result(client: Client, place_id: str, email: str | None,
 
 
 def get_leads_ready_for_instantly(client: Client, limit: int = 500) -> list[dict]:
-    """Golden leads with a found email that haven't been pushed to Instantly yet."""
     all_leads: list[dict] = []
     offset = 0
     while len(all_leads) < limit:
@@ -273,8 +242,6 @@ def mark_lead_push_failed(client: Client, place_id: str, note: str) -> None:
 
 
 def get_golden_leads(client: Client, min_rating: float, min_reviews: int) -> list[dict]:
-    """Only returns leads that also have a phone number -- 'Active' was one of
-    the three original criteria, a lead you can't call isn't callable."""
     all_leads: list[dict] = []
     offset = 0
     while True:
@@ -311,3 +278,44 @@ def mark_unsubscribed(client: Client, email: str) -> None:
     client.table("leads").update(
         {"unsubscribed": True, "email_status": "unsubscribed"}
     ).eq("contact_email", email).execute()
+
+
+def get_laas_available_leads(client: Client, exclude_counties: list[str],
+                               niches: list[str] | None = None,
+                               limit: int = 500) -> list[dict]:
+    """
+    Leads eligible to sell as part of JoshWeb Leads (LaaS) -- i.e. NOT in
+    JoshWeb's own core counties (never sold, those are reserved for JoshWeb's
+    own outreach), and marked 'available' (not already sold/reserved to
+    another subscriber). Optionally filtered to specific niches.
+    """
+    all_leads: list[dict] = []
+    offset = 0
+    while len(all_leads) < limit:
+        page_limit = min(PAGE_SIZE, limit - len(all_leads))
+        query = (
+            client.table("leads")
+            .select("*")
+            .eq("laas_status", "available")
+            .not_.in_("county", exclude_counties)
+            .not_.is_("phone", "null")
+        )
+        if niches:
+            query = query.in_("niche", niches)
+        resp = query.range(offset, offset + page_limit - 1).execute()
+        batch = resp.data or []
+        all_leads.extend(batch)
+        if len(batch) < page_limit:
+            break
+        offset += page_limit
+    return all_leads
+
+
+def mark_leads_sold_to(client: Client, place_ids: list[str], subscriber_email: str) -> None:
+    """Marks a batch of leads as sold/exclusive to a specific LaaS subscriber
+    -- excludes them from all future exports to anyone else."""
+    client.table("leads").update({
+        "laas_status": "sold",
+        "laas_sold_to": subscriber_email,
+        "laas_sold_at": datetime.now(timezone.utc).isoformat(),
+    }).in_("place_id", place_ids).execute()

@@ -428,3 +428,16 @@ def load_google_search_cx() -> str:
 
 def load_searlo_key() -> str:
     return _require("SEARLO_API_KEY")
+
+
+# JoshWeb Leads (LaaS) -- your own 5 core counties are NEVER sold as LaaS
+# leads, since you're personally pursuing them for JoshWeb's own outreach.
+LAAS_CORE_COUNTIES: list[str] = ["Polk", "Orange", "Osceola", "Seminole", "Lake"]
+
+# Separate niche list for the LaaS product -- scraped independently from
+# JoshWeb's own service niches, using the same 268-city target list.
+LAAS_NICHES: list[tuple[str, str]] = [
+    ("web design agency", "web_design_agency"),
+    ("website design company", "website_design_company"),
+    ("digital marketing agency", "digital_marketing_agency"),
+]
