@@ -319,3 +319,34 @@ def mark_leads_sold_to(client: Client, place_ids: list[str], subscriber_email: s
         "laas_sold_to": subscriber_email,
         "laas_sold_at": datetime.now(timezone.utc).isoformat(),
     }).in_("place_id", place_ids).execute()
+
+
+def get_laas_leads_for_email_search(client: Client, exclude_counties: list[str],
+                                      niches: list[str], limit: int = 500) -> list[dict]:
+    """
+    LaaS-specific email search targets: agencies in the given niches, outside
+    JoshWeb's core counties, with a real website to scrape, that haven't had
+    an email search attempted yet. Deliberately does NOT filter on
+    website_status -- unlike JoshWeb's own leads, we don't care whether these
+    agencies' own sites are good or bad, we just need their contact email, so
+    skipping the grading step entirely is fine here.
+    """
+    all_leads: list[dict] = []
+    offset = 0
+    while len(all_leads) < limit:
+        page_limit = min(PAGE_SIZE, limit - len(all_leads))
+        query = (
+            client.table("leads")
+            .select("*")
+            .in_("niche", niches)
+            .not_.in_("county", exclude_counties)
+            .not_.is_("website_url", "null")
+            .is_("email_searched_at", "null")
+        )
+        resp = query.range(offset, offset + page_limit - 1).execute()
+        batch = resp.data or []
+        all_leads.extend(batch)
+        if len(batch) < page_limit:
+            break
+        offset += page_limit
+    return all_leads

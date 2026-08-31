@@ -340,3 +340,44 @@ def print_golden_leads_summary(settings: Settings) -> None:
             f"{lead['rating']}★ ({lead['review_count']}) "
             f"[{lead['website_status']}] {lead.get('phone') or 'no phone'}"
         )
+
+
+def run_find_laas_emails(settings: Settings, exclude_counties: list[str], niches: list[str],
+                          max_leads: int | None = None) -> None:
+    """
+    LaaS-specific email search -- deliberately skips grading entirely, since
+    we don't care whether these agencies' own websites are good or bad, just
+    need their contact email. Reuses the same website-scraping find_email()
+    logic as JoshWeb's own pipeline, just against a different target query.
+    """
+    client = db.get_client(settings.supabase_url, settings.supabase_key)
+    leads = db.get_laas_leads_for_email_search(
+        client, exclude_counties=exclude_counties, niches=niches, limit=max_leads or 500,
+    )
+    total = len(leads)
+    logger.info("Searching for emails on %d LaaS agency leads using %d workers", total, settings.grade_workers)
+
+    found_count = 0
+    completed = 0
+    with ThreadPoolExecutor(max_workers=settings.grade_workers) as pool:
+        futures = {pool.submit(_find_email_one, lead, settings): lead for lead in leads}
+        for future in as_completed(futures):
+            lead, result = future.result()
+            db.upsert_email_search_result(
+                client, lead["place_id"], result.email, result.confidence,
+                result.source_url, result.notes,
+            )
+            if result.email:
+                found_count += 1
+
+            with _progress_lock:
+                completed += 1
+                current = completed
+
+            logger.info(
+                "[%d/%d] %s -> %s (%s)",
+                current, total, lead.get("business_name"), result.email or "NOT FOUND", result.confidence,
+            )
+
+    logger.info("LaaS email search complete. Found emails for %d/%d agency leads.", found_count, total)
+    notify(f"📧 LaaS email search complete. Found {found_count}/{total} agency emails.")

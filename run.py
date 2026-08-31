@@ -4,10 +4,11 @@ CLI entry point for the Lead Generation Engine + Outreach Pipeline.
 
 Usage:
     python run.py scrape                # pull fresh leads from Places API into Supabase
-    python run.py scrape-laas            # scrape LaaS-specific niches (web/marketing agencies)
+    python run.py scrape-laas           # scrape LaaS-specific niches (web/marketing agencies)
     python run.py grade                 # visit + classify websites for ungraded leads
     python run.py grade --limit 50      # grade only the next 50 (useful for testing)
     python run.py find-emails           # scrape Bucket A leads' sites for a contact email
+    python run.py find-laas-emails      # scrape LaaS agency leads' sites for a contact email (skips grading)
     python run.py find-whois-emails     # RDAP/WHOIS lookup for leads with dead domains
     python run.py push-instantly        # push leads with a found email into your Instantly campaign
     python run.py summary               # print current golden leads from the DB
@@ -22,6 +23,7 @@ import sys
 
 from src import db
 from src.config import (
+    LAAS_CORE_COUNTIES,
     LAAS_NICHES,
     load_searlo_key,
     load_instantly_campaign_id,
@@ -31,6 +33,7 @@ from src.config import (
 from src.pipeline import (
     print_golden_leads_summary,
     run_find_emails,
+    run_find_laas_emails,
     run_find_snippet_emails,
     run_find_whois_emails,
     run_grade,
@@ -50,13 +53,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="WaaS Agency Lead Generation + Outreach Engine")
     parser.add_argument(
         "command",
-        choices=["scrape", "scrape-laas", "grade", "find-emails", "find-whois-emails", "find-snippet-emails",
-                 "push-instantly", "summary", "mark-reply", "all"],
+        choices=["scrape", "scrape-laas", "grade", "find-emails", "find-laas-emails", "find-whois-emails",
+                 "find-snippet-emails", "push-instantly", "summary", "mark-reply", "all"],
         help="Which phase to run.",
     )
     parser.add_argument(
         "--limit", type=int, default=None,
-        help="Max leads to process in this run (grade/find-emails/find-whois-emails/push-instantly commands).",
+        help="Max leads to process in this run.",
     )
     parser.add_argument("--email", type=str, default=None, help="Lead's email (mark-reply command).")
     parser.add_argument("--status", type=str, choices=REPLY_STATUSES, default=None,
@@ -74,6 +77,9 @@ def main() -> int:
         run_grade(settings, max_leads=args.limit)
     if args.command == "find-emails":
         run_find_emails(settings, max_leads=args.limit)
+    if args.command == "find-laas-emails":
+        run_find_laas_emails(settings, exclude_counties=LAAS_CORE_COUNTIES, niches=[n[1] for n in LAAS_NICHES],
+                              max_leads=args.limit)
     if args.command == "find-whois-emails":
         run_find_whois_emails(settings, max_leads=args.limit)
     if args.command == "find-snippet-emails":
